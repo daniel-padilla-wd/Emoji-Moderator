@@ -1,0 +1,36 @@
+{
+	"type": "modal",
+	"submit": {
+		"type": "plain_text",
+		"text": "Submit",
+		"emoji": true
+	},
+	"close": {
+		"type": "plain_text",
+		"text": "Cancel",
+		"emoji": true
+	},
+	"title": {
+		"type": "plain_text",
+		"text": "Remove Emoji",
+		"emoji": true
+	},
+	"callback_id": "memes",
+	"blocks": [
+		{
+			"type": "input",
+			"block_id": "input_block",
+			"label": {
+				"type": "plain_text",
+				"text": "Anything else you want to tell the user?",
+				"emoji": true
+			},
+			"element": {
+				"type": "plain_text_input",
+				"action_id": "submit_button",
+				"multiline": true
+			},
+			"optional": true
+		}
+	]
+}
