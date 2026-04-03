@@ -1,2 +1,4 @@
 *.sh
 responses
+.env
+.DS_Store

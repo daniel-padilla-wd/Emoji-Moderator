@@ -1,66 +1,49 @@
 import os
 import json
 import requests
-from requests import Response
 import datetime
 from zoneinfo import ZoneInfo
 import re
+import aws_secrets
+import ui_templates
 
 
 from slack_bolt import App
+from slack_bolt.adapter.aws_lambda import SlackRequestHandler
 from slack_sdk.errors import SlackApiError
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+
 
 import logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 from dotenv import load_dotenv
 load_dotenv()
 
-SLACK_APP_TOKEN= os.getenv("APP_TOKEN")
-SLACK_SIGNING_SECRET = os.getenv("SIGNING_SECRET")
-SLACK_BOT_TOKEN = os.getenv("BOT_TOKEN")
-SLACK_USER_TOKEN = os.getenv("USER_TOKEN")
+SLACK_SIGNING_SECRET = aws_secrets.get_signing_secret()
+SLACK_BOT_TOKEN = aws_secrets.get_bot_token()
+SLACK_USER_TOKEN = aws_secrets.get_user_token()
+MOD_CHANNEL = os.getenv("MOD_CHANNEL")
 
 # https://api.slack.com/authentication/verifying-requests-from-slack
 # Initializes your app with your bot token and signing secret
 app = App(
     token=SLACK_BOT_TOKEN,
-    signing_secret=SLACK_SIGNING_SECRET
+    signing_secret=SLACK_SIGNING_SECRET,
+    process_before_response=True
 )
 
-def convert_epoch_timestamp(timestamp: float) -> str:
-    """Converts a Unix timestamp to a human-readable 12-hour datetime string in Pacific Time (Los Angeles).
-    Args:
-        timestamp: The Unix timestamp (integer or float)
-    Returns:
-        A string representing the date and time in Pacific Time (12-hour format).
-    """
-    pacific_time = datetime.datetime.fromtimestamp(timestamp, tz=ZoneInfo("America/Los_Angeles"))
-    return pacific_time.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+# Helper functions
+def get_todays_date() -> str:
+    """Returns today's date in the format %Y-%m-%d %I:%M:%S %p %Z."""
+    # Get the current datetime object
+    now = datetime.datetime.now()
+    # Convert to Pacific Time (Los Angeles)
+    pacific_timezone = ZoneInfo("America/Los_Angeles") 
+    now_aware = now.astimezone(pacific_timezone)
+    formatted_datetime = now_aware.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    return formatted_datetime
 
-def view_block():
-    with open('modal.json', 'r') as file:
-        blocks = json.load(file)
-    return json.dumps(blocks)
-
-def blocks_message(emoji: str, user_id:str, ts:str) -> str:
-    date=convert_epoch_timestamp(float(ts))
-    text=f":{emoji}: was uploaded by <@{user_id}> on {date}"
-    with open('blocks.json', 'r') as file:
-        blocks = json.load(file)
-        blocks["blocks"][0]["text"]["text"]=text
-        blocks["blocks"][1]["elements"][0]["value"]=emoji
-    return json.dumps(blocks["blocks"])
-
-def update_source_msg(response_url:str, text:str) -> Response:
-    payload = {
-        "replace_original": "true",
-        "text": f"{text}"
-    }
-    response = requests.post(response_url, data=json.dumps(payload))
-    return response
-
+# Core Functionality
 def get_actor_id(event_timestamp:str) -> str:
     '''
     Authorization
@@ -80,11 +63,10 @@ def get_actor_id(event_timestamp:str) -> str:
     for event in response.json().get("entries"):
         if event.get("date_create") == event_timestamp:
             return event.get("actor").get("user").get("id")
-    
-# Event payload: (message: {"envelope_id":"6f2e1bfa-360f-4399-8b6d-1f88c02e0253","payload":{"token":"fKwAhlpTIXDnundHLb5GfFYM","team_id":"T08NXSDNGCB","enterprise_id":"E08NY9QJLSW","api_app_id":"A094F1W8E2W","event":{"type":"emoji_changed","subtype":"add","name":"profile","value":"https:\/\/emoji.slack-edge.com\/T08NY9QJLSW\/profile\/383da0ea71393398.jpg","event_ts":"1751677629.004200"},"type":"event_callback","event_id":"Ev0948DDP61Z","event_time":1751677629,"authorizations":[{"enterprise_id":"E08NY9QJLSW","team_id":null,"user_id":"U0942DUS631","is_bot":true,"is_enterprise_install":true}],"is_ext_shared_channel":false},"type":"events_api","accepts_response_payload":false,"retry_attempt":2,"retry_reason":"timeout"})
-# Unhandled request ({'type': 'event_callback', 'event': {'type': 'emoji_changed', 'subtype': 'add'}})
-# [Suggestion] You can handle this type of event with the following listener function:
-@app.event({'type': 'emoji_changed', 'subtype': 'add'})
+
+def respond_to_slack_within_3_seconds(ack):
+    ack()
+
 def handle_emoji_changed_events(ack, body, event, client):
     ack()
     emoji=event["name"]
@@ -92,54 +74,62 @@ def handle_emoji_changed_events(ack, body, event, client):
     actor_id = get_actor_id(event_timestamp=ts)
 
     client.chat_postMessage(
-        channel="C0923REDJ0Z",
+        channel=MOD_CHANNEL,
         text=f":{emoji}: was uploaded by <@{actor_id}>",
-        blocks=blocks_message(emoji, actor_id, ts)
+        blocks=ui_templates.update_blocks_message(emoji, actor_id, ts)
     )
+app.event({'type': 'emoji_changed', 'subtype': 'add'})(ack=respond_to_slack_within_3_seconds, lazy=[handle_emoji_changed_events])
 
-# Unhandled request ({'type': 'block_actions', 'action_id': 'remove_emoji'})
-# [Suggestion] You can handle this type of event with the following listener function:
-@app.action("remove_emoji")
 def handle_remove_button(ack, body, client):
     ack()
     trigger_id=body["trigger_id"]
+    private_metadata={
+        "emoji":body["actions"][0]["value"],
+        "user_id":re.findall(r"<@([^>]+)>", body["message"]["text"])[0],
+        "message_ts":body["message"]["ts"],
+        "current_message":body["message"]["blocks"][0]["text"]["text"]
+    }
     client.views_open(
-        view=view_block(),
+        view=ui_templates.revoke_message_modal(private_metadata),
         trigger_id=trigger_id
     )
-    """
-    ts=float(body["actions"][0]["action_ts"])
-    date=convert_epoch_timestamp(ts)
-    emoji=body["actions"][0]["value"]
-    actor_id=body["user"]["id"]
-    prev_message=body["message"]["text"]
-    user_id=re.findall(r"<@([^>]+)>", prev_message)[0]
-    new_message=f":x: `:{emoji}:` was removed by <@{actor_id}> on {date}"
-    client.admin_emoji_remove(
-        token=SLACK_USER_TOKEN,
-        name=emoji
-    )
-    # https://api.slack.com/interactivity/handling#updating_message_response
-    update_source_msg(body["response_url"], f"{prev_message}\n{new_message}")
+app.action("remove_emoji")(ack=respond_to_slack_within_3_seconds, lazy=[handle_remove_button])
 
-    client.chat_postMessage(
-        channel=user_id,
-        text=new_message
-    )
-"""
-# Unhandled request ({'type': 'event_callback', 'event': {'type': 'emoji_changed', 'subtype': 'remove'}})
-# [Suggestion] You can handle this type of event with the following listener function:
-@app.event({'type': 'emoji_changed', 'subtype': 'remove'})
 def handle_emoji_removal(ack):
     ack()
-    pass # Do nothing
+    pass # Do nothing, this is just to acknowledge the event
+app.event({'type': 'emoji_changed', 'subtype': 'remove'})(ack=respond_to_slack_within_3_seconds, lazy=[handle_emoji_removal])
 
-# Unhandled request ({'type': 'view_submission', 'view': {'type': 'modal', 'callback_id': ''}})
-# [Suggestion] You can handle this type of event with the following listener function:
-@app.view({'type': 'view_submission', 'view': {'type': 'modal', 'callback_id': 'memes'}})
-def handle_view_submission_events(ack, body, logger):
+def handle_view_submission_events(ack, body, client, view, logger):
     ack()
+    today = get_todays_date()
+    private_metadata=json.loads(view["private_metadata"])
+    justification=view["state"]["values"]["input_block"]["submit_button"]["value"]
+    text=f"Your emoji, :{private_metadata["emoji"]}:, was removed on {today}"
+    last_message = private_metadata["current_message"]
+    client.admin_emoji_remove(
+        token=SLACK_USER_TOKEN,
+        name=private_metadata["emoji"]
+    )
+    client.chat_update(
+        channel=MOD_CHANNEL,
+        ts=private_metadata["message_ts"],
+        text=f"{last_message}\n:x: `:{private_metadata['emoji']}:` was removed by <@{body['user']['id']}> on {today}\nJustification: {justification}",
+    )
+    if justification == None:
+        client.chat_postMessage(
+            channel=private_metadata["user_id"],
+            text=text
+        )
+    else:
+        client.chat_postMessage(
+            channel=private_metadata["user_id"],
+            text=f"{text}\nJustification: {justification}"
+        )
     logger.info(body)
+app.view("revoke_message_modal")(ack=respond_to_slack_within_3_seconds, lazy=[handle_view_submission_events])
 
-if __name__ == "__main__":      
-    SocketModeHandler(app, SLACK_APP_TOKEN).start()
+# AWS Lambda entrypoint
+def handler(event, context):
+    slack_handler = SlackRequestHandler(app=app)
+    return slack_handler.handle(event, context)
